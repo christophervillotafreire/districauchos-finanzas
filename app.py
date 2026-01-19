@@ -31,8 +31,7 @@ def procesar_archivos(archivo_excel, pct_comision):
             
             # Palabras prohibidas (Filas de totales o balances)
             palabras_a_eliminar = [
-                "TOTAL VENTAS EFECTIVO", "TOTAL VENTAS NEQUI", "TOTAL GASTOS CAJA", 
-                "EFECTIVO EN CAJA (DINERO FÍSICO)", "TOTAL DEVOLUCIONES", "UTILIDAD DEL DÍA (TOTAL)"
+                "TOTAL", "EFECTIVO", "UTILIDAD"
             ]
             
             # Filtramos: Nos quedamos solo con las filas que NO contengan esas palabras en Descripción
