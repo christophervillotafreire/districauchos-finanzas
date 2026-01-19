@@ -10,109 +10,167 @@ from datetime import datetime
 # --- CONFIGURACIÓN DE DRIVE ---
 def subir_a_drive(archivo_excel, nombre_archivo):
     try:
-        # Recuperamos la info secreta desde Streamlit Secrets
         gcp_service_account = st.secrets["gcp_service_account"]
         creds = service_account.Credentials.from_service_account_info(
             gcp_service_account, scopes=["https://www.googleapis.com/auth/drive"]
         )
         service = build('drive', 'v3', credentials=creds)
-
-        # ID de la carpeta
         folder_id = st.secrets["drive_folder_id"] 
 
         file_metadata = {'name': nombre_archivo, 'parents': [folder_id]}
         media = MediaIoBaseUpload(archivo_excel, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet')
         
         file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        return True
+        return True, file.get('id')
     except Exception as e:
-        st.error(f"Error subiendo a Drive: {e}")
-        return False
+        return False, str(e)
 
 # --- LÓGICA DE PROCESAMIENTO ---
-def procesar_archivos(archivo_excel):
+def procesar_archivos(archivo_excel, pct_comision):
     dfs = []
+    
     try:
-        # Leer TODAS las hojas (sheet_name=None) y saltar encabezados (header=5)
+        # Leemos todas las hojas
         xls = pd.read_excel(archivo_excel, sheet_name=None, header=5)
         
         for nombre_hoja, df in xls.items():
-            # Filtro: Solo procesar hojas que tengan estructura de ventas
+            # 1. LIMPIEZA INICIAL
+            # Verificamos columnas clave
             if 'Descripción' not in df.columns or 'Transferencia (+)' not in df.columns:
                 continue
-
-            # Limpieza
+            
+            # --- CORRECCIÓN DE TOTALES ---
+            # Eliminamos filas que sean resúmenes del día (Totales, Utilidad, Saldos)
+            # Convertimos a string para evitar errores
+            df = df[~df['Descripción'].astype(str).str.contains("TOTAL", case=False, na=False)]
+            df = df[~df['Descripción'].astype(str).str.contains("UTILIDAD", case=False, na=False)]
+            df = df[~df['Descripción'].astype(str).str.contains("EFECTIVO EN CAJA", case=False, na=False)]
+            df = df[~df['Descripción'].astype(str).str.contains("BASE DE CAJA", case=False, na=False)]
+            
+            # Llenamos vacíos con 0
             cols_dinero = ['Efectivo (+)', 'Transferencia (+)']
             df[cols_dinero] = df[cols_dinero].fillna(0)
             df['Descripción'] = df['Descripción'].fillna('')
 
-            # Función interna de clasificación
+            # Función para clasificar cada venta
             def clasificar_transaccion(fila):
-                desc = str(fila['Descripción']).lower()
+                desc = str(fila['Descripción']).upper() # Todo a mayúsculas para facilitar búsqueda
                 monto_transf = fila['Transferencia (+)']
-                etiqueta_pago = "Efectivo"
+                monto_efectivo = fila['Efectivo (+)']
                 
-                # 1. Tipo de Pago
-                if monto_transf > 0:
-                    if 'nequi' in desc: etiqueta_pago = 'Nequi'
-                    elif 'qr' in desc or 'bancolombia' in desc: etiqueta_pago = 'QR Bancolombia'
-                    else: etiqueta_pago = 'Transferencia (Otro)'
+                # A. CLASIFICACIÓN DE PAGO (Nequi / QR / Efectivo)
+                tipo_pago = "Efectivo" # Por defecto
                 
-                # 2. Empleado (%)
-                empleados = re.findall(r'%(\w+)', str(fila['Descripción']))
-                empleado_str = ", ".join(empleados) if empleados else "Sin Comision"
+                # Prioridad: Si la descripción lo dice explícitamente
+                if "NEQUI" in desc:
+                    tipo_pago = "Nequi"
+                elif "QR" in desc or "BANCOLOMBIA" in desc:
+                    tipo_pago = "QR Bancolombia"
+                elif monto_transf > 0: 
+                    # Si hay dinero en transferencia pero no dice qué es, asumimos Transferencia
+                    tipo_pago = "Transferencia (Otro)"
+                
+                # B. CLASIFICACIÓN DE EMPLEADO (%A, %J)
+                empleado = "Sin Comision"
+                # Buscamos %A, %J, %L, etc.
+                match = re.search(r'%([A-Z])', desc)
+                if match:
+                    inicial = match.group(1)
+                    if inicial == 'A': empleado = "Anderson (%A)"
+                    elif inicial == 'J': empleado = "Jhosept (%J)"
+                    else: empleado = f"Empleado %{inicial}"
+                
+                return pd.Series([tipo_pago, empleado])
 
-                return pd.Series([etiqueta_pago, empleado_str])
-
+            # Aplicamos la clasificación
             df[['Tipo_Pago', 'Empleado']] = df.apply(clasificar_transaccion, axis=1)
-            dfs.append(df)
+            
+            # Solo guardamos si hay dinero involucrado (para no guardar filas vacías)
+            df_con_dinero = df[(df['Efectivo (+)'] != 0) | (df['Transferencia (+)'] != 0)]
+            
+            if not df_con_dinero.empty:
+                # Agregamos columna de fecha basada en la hoja (opcional, ayuda a auditar)
+                df_con_dinero['Hoja_Origen'] = nombre_hoja
+                dfs.append(df_con_dinero)
             
     except Exception as e:
-        st.error(f"Error procesando el Excel: {e}")
+        st.error(f"Error leyendo el Excel: {e}")
         return None
 
     if not dfs: return None
-    return pd.concat(dfs, ignore_index=True)
+    
+    # Tabla consolidada
+    df_final = pd.concat(dfs, ignore_index=True)
+    
+    # Calculamos columna Total Dinero (Efectivo + Transf)
+    df_final['Total Venta'] = df_final['Efectivo (+)'] + df_final['Transferencia (+)']
+    
+    # Calculamos la Comisión
+    df_final['Comisión Calculada'] = 0
+    mask_comision = df_final['Empleado'] != "Sin Comision"
+    df_final.loc[mask_comision, 'Comisión Calculada'] = df_final.loc[mask_comision, 'Total Venta'] * (pct_comision / 100)
+    
+    return df_final
 
 # --- INTERFAZ GRÁFICA ---
-st.title("📊 Finanzas Districauchos")
-st.write("Sube el Excel mensual (con todas las hojas diarias).")
+st.set_page_config(page_title="Finanzas Districauchos", page_icon="💰")
 
-archivo = st.file_uploader("Cargar Excel del Mes", type=['xlsx'])
+st.title("📊 Finanzas Districauchos")
+st.markdown("---")
+
+col1, col2 = st.columns(2)
+with col1:
+    archivo = st.file_uploader("📂 Cargar Excel Mensual", type=['xlsx'])
+with col2:
+    st.info("Configuración de Comisiones")
+    porcentaje = st.number_input("Porcentaje de Comisión (%)", min_value=0, max_value=100, value=15)
 
 if archivo:
-    if st.button("Procesar y Subir a Drive"):
-        with st.spinner('Procesando días...'):
-            df_completo = procesar_archivos(archivo)
+    if st.button("🚀 Procesar Datos y Subir a Drive", type="primary"):
+        with st.spinner('Analizando hoja por hoja...'):
+            df_completo = procesar_archivos(archivo, porcentaje)
         
         if df_completo is not None:
-            # 1. Resumen Pagos
-            st.subheader("💰 Resumen por Tipo de Pago")
-            resumen_pago = df_completo.groupby('Tipo_Pago')[['Efectivo (+)', 'Transferencia (+)']].sum().sum(axis=1)
-            st.dataframe(resumen_pago)
+            # 1. RESUMEN DE VENTAS (Nequi vs QR)
+            st.subheader("💰 Resumen de Dineros")
+            resumen_pago = df_completo.groupby('Tipo_Pago')[['Efectivo (+)', 'Transferencia (+)']].sum()
+            # Total general
+            resumen_pago['Total Global'] = resumen_pago['Efectivo (+)'] + resumen_pago['Transferencia (+)']
+            st.dataframe(resumen_pago.style.format("${:,.0f}"))
 
-            # 2. Resumen Empleados
-            st.subheader("👷 Comisiones (Etiqueta %)")
-            df_comisiones = df_completo[df_completo['Empleado'] != "Sin Comision"].copy()
-            if not df_comisiones.empty:
-                df_comisiones['Empleado'] = df_comisiones['Empleado'].str.split(", ")
-                df_comisiones = df_comisiones.explode('Empleado')
-                resumen_empleados = df_comisiones.groupby('Empleado')[['Efectivo (+)', 'Transferencia (+)']].sum().sum(axis=1)
-                st.dataframe(resumen_empleados)
+            # 2. RESUMEN DE COMISIONES (Lo que pediste de %A y %J)
+            st.subheader(f"👷 Liquidación de Comisiones ({porcentaje}%)")
+            
+            # Filtramos solo empleados
+            df_emp = df_completo[df_completo['Empleado'] != "Sin Comision"]
+            
+            if not df_emp.empty:
+                resumen_emp = df_emp.groupby('Empleado').agg(
+                    Total_Trabajos=('Total Venta', 'sum'),
+                    Comision_A_Pagar=('Comisión Calculada', 'sum')
+                )
+                st.dataframe(resumen_emp.style.format("${:,.0f}"))
             else:
-                st.info("No hay ventas con etiqueta %Empleado")
+                st.warning("No se encontraron ventas con etiquetas %A o %J")
 
-            # 3. Preparar y Subir
+            # 3. SUBIR A DRIVE
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_completo.to_excel(writer, index=False, sheet_name='Detallado')
+                df_completo.to_excel(writer, index=False, sheet_name='Detallado_Ventas')
                 resumen_pago.to_excel(writer, sheet_name='Resumen_Pagos')
-            buffer.seek(0)
+                if not df_emp.empty:
+                    resumen_emp.to_excel(writer, sheet_name='Resumen_Comisiones')
             
+            buffer.seek(0)
             fecha_hoy = datetime.now().strftime("%Y-%m-%d_%H-%M")
             nombre_archivo = f"Consolidado_Districauchos_{fecha_hoy}.xlsx"
             
-            if subir_a_drive(buffer, nombre_archivo):
-                st.success(f"✅ ¡Éxito! Archivo guardado en Drive: {nombre_archivo}")
+            st.markdown("---")
+            st.write("☁️ Subiendo a Google Drive...")
+            exito, mensaje = subir_a_drive(buffer, nombre_archivo)
+            
+            if exito:
+                st.success(f"✅ ¡Guardado Exitoso! ID Archivo: {mensaje}")
             else:
-                st.error("⚠️ Error subiendo a Drive. Revisa los Secrets.")
+                st.error(f"❌ Error subiendo a Drive: {mensaje}")
+                st.warning("Revisa que el ID de la carpeta en 'Secrets' sea correcto y que el 'robot' tenga permiso de Editor en esa carpeta.")
