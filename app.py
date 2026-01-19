@@ -1,87 +1,65 @@
 import streamlit as st
 import pandas as pd
 import re
-from google.oauth2 import service_account
-from googleapiclient.discovery import build
-from googleapiclient.http import MediaIoBaseUpload
 import io
 from datetime import datetime
-
-# --- CONFIGURACIÓN DE DRIVE (CORREGIDA) ---
-def subir_a_drive(archivo_excel, nombre_archivo):
-    try:
-        gcp_service_account = st.secrets["gcp_service_account"]
-        creds = service_account.Credentials.from_service_account_info(
-            gcp_service_account, scopes=["https://www.googleapis.com/auth/drive"]
-        )
-        service = build('drive', 'v3', credentials=creds)
-        folder_id = st.secrets["drive_folder_id"] 
-
-        # TRUCO: Convertimos a Google Sheet para evitar error de cuota (Storage Quota)
-        # mimeType de destino: Google Sheet
-        file_metadata = {
-            'name': nombre_archivo.replace('.xlsx', ''), # Quitamos extensión porque será Google Sheet
-            'parents': [folder_id],
-            'mimeType': 'application/vnd.google-apps.spreadsheet' 
-        }
-        
-        # mimeType de origen: Excel
-        media = MediaIoBaseUpload(archivo_excel, mimetype='application/vnd.openxmlformats-officedocument.spreadsheetml.sheet', resumable=True)
-        
-        file = service.files().create(body=file_metadata, media_body=media, fields='id').execute()
-        return True, file.get('id')
-    except Exception as e:
-        return False, str(e)
 
 # --- LÓGICA DE PROCESAMIENTO ---
 def procesar_archivos(archivo_excel, pct_comision):
     dfs = []
     
     try:
-        # Leemos todas las hojas
+        # Leemos todas las hojas del Excel
         xls = pd.read_excel(archivo_excel, sheet_name=None, header=5)
         
         for nombre_hoja, df in xls.items():
-            # 1. LIMPIEZA INICIAL
+            # 1. VALIDACIÓN BÁSICA
+            # Si la hoja no tiene las columnas de dinero, la saltamos (ej: hojas de resumen vacías)
             if 'Descripción' not in df.columns or 'Transferencia (+)' not in df.columns:
                 continue
             
-            # --- FILTRO ANTI-TOTALES (Para que no sume doble) ---
-            # Eliminamos filas que contengan estas palabras clave
-            filtro_basura = df['Descripción'].astype(str).str.upper()
-            df = df[~filtro_basura.str.contains("TOTAL", na=False)]
-            df = df[~filtro_basura.str.contains("UTILIDAD", na=False)]
-            df = df[~filtro_basura.str.contains("EFECTIVO EN CAJA", na=False)]
-            df = df[~filtro_basura.str.contains("BASE DE CAJA", na=False)]
-            df = df[~filtro_basura.str.contains("EGRESOS", na=False)]
+            # --- FILTRO MAESTRO (Para eliminar filas basura y totales duplicados) ---
+            # Convertimos a texto y mayúsculas para buscar palabras clave
+            filtro = df['Descripción'].astype(str).str.upper()
             
-            # Llenamos vacíos con 0
+            # Solo mantenemos las filas que NO tengan estas palabras:
+            df = df[~filtro.str.contains("TOTAL", na=False)]
+            df = df[~filtro.str.contains("UTILIDAD", na=False)]
+            df = df[~filtro.str.contains("EFECTIVO EN CAJA", na=False)]
+            df = df[~filtro.str.contains("BASE DE CAJA", na=False)]
+            df = df[~filtro.str.contains("EGRESOS", na=False)]
+            df = df[~filtro.str.contains("RESUMEN", na=False)]
+            df = df[~filtro.str.contains("SALDO", na=False)]
+            
+            # 2. LIMPIEZA DE NÚMEROS
             cols_dinero = ['Efectivo (+)', 'Transferencia (+)']
-            # Asegurar que sean números
             for col in cols_dinero:
+                # Forzamos a que sean números (si hay texto, lo pone en 0)
                 df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
                 
             df['Descripción'] = df['Descripción'].fillna('')
 
-            # Función para clasificar cada venta
+            # 3. FUNCIÓN DE CLASIFICACIÓN (Detecta Nequi, QR y Empleados)
             def clasificar_transaccion(fila):
                 desc = str(fila['Descripción']).upper() 
                 monto_transf = fila['Transferencia (+)']
+                monto_efectivo = fila['Efectivo (+)']
                 
-                # A. CLASIFICACIÓN DE PAGO
-                tipo_pago = "Efectivo" # Por defecto
+                # --- A. TIPO DE PAGO ---
+                tipo_pago = "Efectivo" # Valor por defecto
                 
-                # Prioridad: Si la descripción dice NEQUI o QR
+                # Si dice explícitamente el medio de pago en la descripción
                 if "NEQUI" in desc:
                     tipo_pago = "Nequi"
                 elif "QR" in desc or "BANCOLOMBIA" in desc:
                     tipo_pago = "QR Bancolombia"
                 elif monto_transf > 0: 
+                    # Si hay plata en columna transferencia pero no dice qué es
                     tipo_pago = "Transferencia (Otro)"
                 
-                # B. CLASIFICACIÓN DE EMPLEADO (%A, %J)
+                # --- B. EMPLEADO (%A, %J) ---
                 empleado = "Sin Comision"
-                # Buscamos %A, %J, etc.
+                # Busca el patrón %LETRA (Ej: %A, %J, %P)
                 match = re.search(r'%([A-Z])', desc)
                 if match:
                     inicial = match.group(1)
@@ -91,95 +69,109 @@ def procesar_archivos(archivo_excel, pct_comision):
                 
                 return pd.Series([tipo_pago, empleado])
 
-            # Aplicamos la clasificación
+            # Aplicamos la clasificación fila por fila
             df[['Tipo_Pago', 'Empleado']] = df.apply(clasificar_transaccion, axis=1)
             
-            # Solo guardamos si hay dinero real (filas que suman algo)
-            df_con_dinero = df[(df['Efectivo (+)'] != 0) | (df['Transferencia (+)'] != 0)]
+            # 4. FILTRO FINAL
+            # Solo guardamos filas que tengan dinero real (mayor a 0)
+            df_con_dinero = df[(df['Efectivo (+)'] > 0) | (df['Transferencia (+)'] > 0)]
             
             if not df_con_dinero.empty:
+                # Agregamos una columna para saber de qué día vino el dato
+                df_con_dinero['Fecha_Origen'] = nombre_hoja
                 dfs.append(df_con_dinero)
             
     except Exception as e:
-        st.error(f"Error leyendo el Excel: {e}")
+        st.error(f"Error procesando el archivo: {e}")
         return None
 
     if not dfs: return None
     
-    # Tabla consolidada
+    # Unimos todas las hojas limpias en una sola tabla
     df_final = pd.concat(dfs, ignore_index=True)
     
-    # Calculamos columna Total Venta
+    # Columna Total (Suma de las dos columnas)
     df_final['Total Venta'] = df_final['Efectivo (+)'] + df_final['Transferencia (+)']
     
-    # Calculamos la Comisión según el porcentaje que pusiste en pantalla
+    # Calculamos la Comisión Dinámica
     df_final['Comisión Calculada'] = 0
     mask_comision = df_final['Empleado'] != "Sin Comision"
-    # Lógica: Si vendió 200.000 y el % es 15, la comisión es 30.000
+    # Fórmula: Venta * (Porcentaje / 100)
     df_final.loc[mask_comision, 'Comisión Calculada'] = df_final.loc[mask_comision, 'Total Venta'] * (pct_comision / 100.0)
     
     return df_final
 
 # --- INTERFAZ GRÁFICA ---
-st.set_page_config(page_title="Finanzas Districauchos", page_icon="💰")
+st.set_page_config(page_title="Finanzas Districauchos", page_icon="💰", layout="centered")
 
 st.title("📊 Finanzas Districauchos")
+st.write("Herramienta de consolidación y cálculo de comisiones.")
 st.markdown("---")
 
-col1, col2 = st.columns(2)
+# Panel de Configuración
+col1, col2 = st.columns([1, 1])
 with col1:
     archivo = st.file_uploader("📂 Cargar Excel Mensual", type=['xlsx'])
 with col2:
-    st.info("⚙️ Configuración de Comisiones")
-    # Aquí escribes el porcentaje manualmente
+    st.info("⚙️ Configuración")
+    # Selector de porcentaje numérico
     porcentaje = st.number_input("Porcentaje de Comisión (%)", min_value=0, max_value=100, value=15)
 
 if archivo:
-    if st.button("🚀 Procesar Datos y Subir a Drive", type="primary"):
-        with st.spinner('Analizando hoja por hoja...'):
+    if st.button("🚀 Procesar Datos", type="primary"):
+        with st.spinner('Leyendo 31 hojas y limpiando totales...'):
             df_completo = procesar_archivos(archivo, porcentaje)
         
         if df_completo is not None:
-            # 1. RESUMEN DE VENTAS
-            st.subheader("💰 Resumen de Dineros (Real)")
+            st.success("✅ ¡Procesamiento Exitoso!")
+            
+            # --- SECCIÓN 1: RESUMEN DE DINEROS ---
+            st.subheader("💰 Resumen Real (Sin Duplicados)")
+            # Agrupamos por tipo de pago
             resumen_pago = df_completo.groupby('Tipo_Pago')[['Efectivo (+)', 'Transferencia (+)']].sum()
+            # Totalizamos filas
             resumen_pago['Total Global'] = resumen_pago['Efectivo (+)'] + resumen_pago['Transferencia (+)']
+            
+            # Mostramos tabla con formato de pesos
             st.dataframe(resumen_pago.style.format("${:,.0f}"))
-
-            # 2. RESUMEN DE COMISIONES (ANDERSON Y JHOSEPT)
+            
+            # --- SECCIÓN 2: COMISIONES ---
             st.subheader(f"👷 Liquidación de Comisiones ({porcentaje}%)")
             
+            # Filtramos solo lo que tiene empleado asignado
             df_emp = df_completo[df_completo['Empleado'] != "Sin Comision"]
             
             if not df_emp.empty:
+                # Resumen por empleado
                 resumen_emp = df_emp.groupby('Empleado').agg(
-                    Total_Trabajos=('Total Venta', 'sum'),
+                    Ventas_Totales=('Total Venta', 'sum'),
                     Comision_A_Pagar=('Comisión Calculada', 'sum')
-                )
-                # Formato bonito de moneda
+                ).sort_values('Comision_A_Pagar', ascending=False)
+                
                 st.dataframe(resumen_emp.style.format("${:,.0f}"))
             else:
-                st.warning("No se encontraron ventas con etiquetas %A o %J")
+                st.warning("⚠️ No se detectaron ventas con etiquetas %A o %J en las descripciones.")
 
-            # 3. SUBIR A DRIVE
-            # Guardamos en buffer temporal
+            # --- SECCIÓN 3: DESCARGA ---
+            st.markdown("---")
+            st.subheader("📥 Descargar Resultados")
+            
+            # Generamos el Excel en memoria
             buffer = io.BytesIO()
             with pd.ExcelWriter(buffer, engine='openpyxl') as writer:
-                df_completo.to_excel(writer, index=False, sheet_name='Detallado_Ventas')
-                resumen_pago.to_excel(writer, sheet_name='Resumen_Pagos')
+                df_completo.to_excel(writer, index=False, sheet_name='Detalle_Todas_Ventas')
+                resumen_pago.to_excel(writer, sheet_name='Resumen_Dineros')
                 if not df_emp.empty:
-                    resumen_emp.to_excel(writer, sheet_name='Resumen_Comisiones')
+                    resumen_emp.to_excel(writer, sheet_name='Liquidacion_Comisiones')
+            
             buffer.seek(0)
+            fecha_hoy = datetime.now().strftime("%Y-%m-%d")
             
-            fecha_hoy = datetime.now().strftime("%Y-%m-%d_%H-%M")
-            nombre_archivo = f"Consolidado_Districauchos_{fecha_hoy}.xlsx"
-            
-            st.markdown("---")
-            st.write("☁️ Subiendo a Google Drive...")
-            exito, mensaje = subir_a_drive(buffer, nombre_archivo)
-            
-            if exito:
-                st.success(f"✅ ¡Guardado Exitoso! \n\nEl archivo se guardó como **Google Sheet** (Hoja de cálculo) con ID: `{mensaje}`")
-                st.balloons()
-            else:
-                st.error(f"❌ Error subiendo a Drive: {mensaje}")
+            # BOTÓN DE DESCARGA
+            st.download_button(
+                label="💾 Descargar Excel Consolidado",
+                data=buffer,
+                file_name=f"Consolidado_Districauchos_{fecha_hoy}.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                type="primary"
+            )
